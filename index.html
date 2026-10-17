@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#313131">
+<title>confessClock</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { --bg: #313131; --btn: #dadada; }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body {
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+    -webkit-user-select: none; user-select: none;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  video { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+
+  #splash {
+    position: fixed; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    transition: opacity .7s ease;
+  }
+  #eye {
+    width: 121px; height: 121px; border-radius: 50%;
+    border: 0; padding: 0; margin: 0;
+    background: var(--btn);
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer;
+    transition: background-color .6s ease, transform .15s ease;
+  }
+  #eye span {
+    font-size: 52px; line-height: 1;
+    font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+    transition: opacity .4s ease;
+  }
+  #eye:active { transform: scale(.96); }
+  #eye:focus-visible { outline: 1px solid #8a8a8a; outline-offset: 6px; }
+  #eye.busy { pointer-events: none; }
+  #msg {
+    position: absolute; left: 16px; right: 16px;
+    top: calc(50% + 60.5px + 24px); margin: 0;
+    text-align: center; color: #8a8a8a;
+    font: 12px/1.5 -apple-system, "Helvetica Neue", Arial, sans-serif;
+    letter-spacing: .02em;
+  }
+  body.on #splash { opacity: 0; pointer-events: none; }
+  body.on #eye { background: var(--bg); }
+  body.on #eye span { opacity: 0; }
+
+  #dbg {
+    position: fixed; left: 12px; bottom: 10px; display: none;
+    color: #9a9a9a; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    white-space: pre; pointer-events: none;
+  }
+  #dbg.show { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline muted autoplay></video>
+<div id="splash">
+  <button id="eye" type="button" aria-label="Turn on the camera"><span aria-hidden="true">👀</span></button>
+  <p id="msg" role="status"></p>
+</div>
+<div id="dbg"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ================= settings ================= */
+  const BG = [0x31, 0x31, 0x31];
+  const MARGIN = 10;          // css px between the outer circle and the short edge of the screen (368 in 388)
+
+  // How the camera's centre column is laid along each hand:
+  // 'planet' – the slit spans the whole radius once: top of the picture at the rim, bottom at the centre.
+  //            The three rings join into one picture that refreshes at three different speeds.
+  // 'ring'   – every ring holds the whole slit inside its own band (top at its outer edge).
+  const SLIT_MAP = 'ring';
+
+  const HOUR = 3600e3;
+  // inner → outer; each ring has one column per 1px of its circumference
+  const RINGS = [
+    { period: 12 * HOUR, frac: 1 / 3, minN: 380 },
+    { period: HOUR,      frac: 2 / 3, minN: 770 },
+    { period: 60e3,      frac: 1,     minN: 1156 },
+  ];
+
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+                   (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+
+  const $ = id => document.getElementById(id);
+  const canvas = $('c'), video = $('v'), splash = $('splash'), btn = $('eye'), msg = $('msg'), dbg = $('dbg');
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+  const mod = (x, n) => ((x % n) + n) % n;
+  const named = name => Object.assign(new Error(name), { name });
+
+  function radiusCss() { return Math.max(30, Math.min(innerWidth, innerHeight) / 2 - MARGIN); }
+  function dpr() { return Math.min(window.devicePixelRatio || 1, 3); }
+
+  let tzMs = 0, tzAt = -Infinity;
+  function tz(now) {
+    if (now - tzAt > 30e3) { tzMs = -new Date(now).getTimezoneOffset() * 60e3; tzAt = now; }
+    return tzMs;
+  }
+
+  /* ================= shaders ================= */
+  const VS = `#version 300 es
+in vec2 p;
+void main() { gl_Position = vec4(p, 0.0, 1.0); }`;
+
+  // copies the centre column of the camera frame into one or more columns of a ring texture
+  const FS_COPY = `#version 300 es
+precision highp float;
+uniform sampler2D uV;
+uniform float uX;         // texture x of the camera's centre column
+uniform float uS;         // slit samples (texture height)
+out vec4 o;
+void main() { o = vec4(texture(uV, vec2(uX, gl_FragCoord.y / uS)).rgb, 1.0); }`;
+
+  const FS_SHOW = `#version 300 es
+precision highp float;
+uniform vec2 uC;          // centre, device px
+uniform vec3 uR;          // radii of hour / minute / second circles, device px
+uniform vec3 uBg;
+uniform int uMap;         // 0 = planet, 1 = ring
+uniform sampler2D uT0, uT1, uT2;
+out vec4 o;
+const float TAU = 6.2831853;
+
+vec3 ring(sampler2D t, vec2 p, float d, float u, float rIn, float rOut) {
+  float v0 = uMap == 0 ? 0.0 : rIn;
+  float span = uMap == 0 ? uR.z : rOut - rIn;
+  float v = 1.0 - (d - v0) / span;                 // top of the slit at the rim
+  vec2 gu = vec2(p.y, -p.x) / (TAU * d * d);       // exact footprint, so the 12 o'clock seam
+  vec2 gv = -p / (d * span);                       // and the crowded centre filter cleanly
+  return textureGrad(t, vec2(u, v), vec2(gu.x, gv.x), vec2(gu.y, gv.y)).rgb;
+}
+void main() {
+  vec2 p = gl_FragCoord.xy - uC;
+  float len = length(p);
+  float d = max(len, 0.5);
+  float u = len > 1e-4 ? fract(atan(p.x, p.y) / TAU) : 0.0;     // 0 at 12 o'clock, clockwise
+  float a0 = clamp(uR.x - len + 0.5, 0.0, 1.0);
+  float a1 = clamp(uR.y - len + 0.5, 0.0, 1.0);
+  float a2 = clamp(uR.z - len + 0.5, 0.0, 1.0);
+  vec3 c = uBg * (1.0 - a2);
+  if (a0 > 0.0)      c += ring(uT0, p, d, u, 0.0,  uR.x) * a0;
+  if (a1 - a0 > 0.0) c += ring(uT1, p, d, u, uR.x, uR.y) * (a1 - a0);
+  if (a2 - a1 > 0.0) c += ring(uT2, p, d, u, uR.y, uR.z) * (a2 - a1);
+  o = vec4(c, 1.0);
+}`;
+
+  /* ================= GL ================= */
+  let gl = null, progCopy, progShow, LC = {}, LS = {}, videoTex, S = 512, W = 0, H = 0, needDraw = true;
+
+  function program(fs, names) {
+    const sh = (type, src) => {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      return s;
+    };
+    const p = gl.createProgram();
+    gl.attachShader(p, sh(gl.VERTEX_SHADER, VS));
+    gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+    gl.bindAttribLocation(p, 0, 'p');
+    gl.linkProgram(p);
+    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    const loc = {};
+    for (const n of names) loc[n] = gl.getUniformLocation(p, n);
+    return [p, loc];
+  }
+
+  function initGL() {
+    gl = canvas.getContext('webgl2', {
+      alpha: false, antialias: false, depth: false, stencil: false,
+      preserveDrawingBuffer: false, powerPreference: 'low-power'
+    });
+    if (!gl) return false;
+    [progCopy, LC] = program(FS_COPY, ['uV', 'uX', 'uS']);
+    [progShow, LS] = program(FS_SHOW, ['uC', 'uR', 'uBg', 'uMap', 'uT0', 'uT1', 'uT2']);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+    const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+    const R = radiusCss();
+    S = clamp(Math.round(R * dpr()), 256, 1024);
+
+    // camera frame lives on unit 3
+    gl.activeTexture(gl.TEXTURE3);
+    videoTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, videoTex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // one texture per ring: x = angle (1 column per px of rim), y = position along the slit
+    gl.clearColor(BG[0] / 255, BG[1] / 255, BG[2] / 255, 1);
+    RINGS.forEach((r, i) => {
+      r.n = Math.min(4096, Math.max(r.minN, Math.round(2 * Math.PI * R * r.frac)));
+      gl.activeTexture(gl.TEXTURE0 + i);
+      r.tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, r.tex);
+      gl.texStorage2D(gl.TEXTURE_2D, Math.floor(Math.log2(Math.max(r.n, S))) + 1, gl.RGBA8, r.n, S);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      if (aniso) {
+        gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT,
+          Math.min(8, gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+      }
+      r.fbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, r.fbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, r.tex, 0);
+      gl.viewport(0, 0, r.n, S);
+      gl.clear(gl.COLOR_BUFFER_BIT);                // start as #313131
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      r.last = null;
+      r.mip = false;
+    });
+
+    gl.useProgram(progCopy);
+    gl.uniform1i(LC.uV, 3);
+    gl.uniform1f(LC.uS, S);
+    gl.useProgram(progShow);
+    RINGS.forEach((_, i) => gl.uniform1i(LS['uT' + i], i));
+    gl.uniform3f(LS.uBg, BG[0] / 255, BG[1] / 255, BG[2] / 255);
+    gl.uniform1i(LS.uMap, SLIT_MAP === 'ring' ? 1 : 0);
+    resize();
+    return true;
+  }
+
+  function resize() {
+    const k = dpr();
+    W = Math.max(1, Math.round(innerWidth * k));
+    H = Math.max(1, Math.round(innerHeight * k));
+    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+    if (!gl || gl.isContextLost()) return;
+    const R = radiusCss() * k;
+    gl.useProgram(progShow);
+    gl.uniform2f(LS.uC, W / 2, H / 2);
+    gl.uniform3f(LS.uR, R / 3, R * 2 / 3, R);
+    needDraw = true;
+  }
+
+  /* ================= slit-scan ================= */
+  const videoReady = () => video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0;
+
+  // Each hand samples the camera only when it steps onto a new 1px column.
+  // If the page was asleep, the columns it skipped get the frame it wakes up to.
+  function sampleRings(now) {
+    if (!videoReady()) return;
+    const z = tz(now);
+    let ready = false;
+    for (const r of RINGS) {
+      const abs = Math.floor((now + z) * r.n / r.period);   // columns since 1970, local time
+      if (r.last === abs) continue;
+      const count = (r.last === null || abs < r.last) ? 1 : Math.min(abs - r.last, r.n);
+      if (!ready) {
+        gl.activeTexture(gl.TEXTURE3);
+        gl.bindTexture(gl.TEXTURE_2D, videoTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        gl.useProgram(progCopy);
+        const vw = video.videoWidth;
+        gl.uniform1f(LC.uX, (Math.floor(vw / 2) + 0.5) / vw);
+        ready = true;
+      }
+      const start = mod(abs - count + 1, r.n);
+      const first = Math.min(count, r.n - start);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, r.fbo);
+      gl.viewport(start, 0, first, S);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      if (count > first) {
+        gl.viewport(0, 0, count - first, S);
+        gl.drawArrays(gl.TRIANGLES, 0, 3);
+      }
+      r.last = abs;
+      r.mip = true;
+    }
+    if (ready) gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  let dbgAt = 0;
+  function frame(ts) {
+    requestAnimationFrame(frame);
+    if (!gl || gl.isContextLost()) return;
+    sampleRings(Date.now());
+    RINGS.forEach((r, i) => {
+      if (!r.mip) return;
+      gl.activeTexture(gl.TEXTURE0 + i);
+      gl.bindTexture(gl.TEXTURE_2D, r.tex);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      r.mip = false;
+      needDraw = true;
+    });
+    if (needDraw) {
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      gl.viewport(0, 0, W, H);
+      gl.useProgram(progShow);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      needDraw = false;
+    }
+    if (dbg.classList.contains('show') && ts - dbgAt > 250) {
+      dbgAt = ts;
+      const t = stream && stream.getVideoTracks()[0];
+      const st = t && t.getSettings ? t.getSettings() : {};
+      dbg.textContent =
+        `camera ${video.videoWidth}×${video.videoHeight} ${st.facingMode || ''} ${st.frameRate ? Math.round(st.frameRate) + 'fps' : ''}\n` +
+        `slit ${S}px   columns ${RINGS.map(r => r.n).join(' / ')}   map ${SLIT_MAP}`;
+    }
+  }
+
+  canvas.addEventListener('webglcontextlost', e => e.preventDefault());
+  canvas.addEventListener('webglcontextrestored', () => { try { initGL(); } catch (_) {} });
+  addEventListener('resize', resize);
+  addEventListener('keydown', e => {
+    if (e.key === 'd' && !e.metaKey && !e.ctrlKey && !e.altKey) dbg.classList.toggle('show');
+  });
+
+  /* ================= camera ================= */
+  let stream = null, started = false, lock = null;
+
+  async function openCamera() {
+    const facing = isMobile ? 'environment' : 'user';   // phone: back camera, computer: selfie camera
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+        audio: false
+      });
+    } catch (e) {
+      if (e.name === 'OverconstrainedError') return navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+      throw e;
+    }
+  }
+
+  function firstFrame() {
+    return new Promise((resolve, reject) => {
+      if (videoReady()) return resolve();
+      const done = () => { if (videoReady()) { cleanup(); resolve(); } };
+      const cleanup = () => { clearInterval(iv); clearTimeout(to); video.removeEventListener('loadeddata', done); };
+      const iv = setInterval(done, 50);
+      const to = setTimeout(() => { cleanup(); reject(named('NoFrames')); }, 8000);
+      video.addEventListener('loadeddata', done);
+    });
+  }
+
+  function errText(e) {
+    const n = e && e.name;
+    if (n === 'NoWebGL') return 'this browser can’t draw the clock (WebGL2 is off or unsupported)';
+    if (n === 'Insecure') return 'open this page over https to use the camera';
+    if (n === 'NotAllowedError' || n === 'SecurityError') return 'camera access was blocked — allow it in the browser settings, then reload';
+    if (n === 'NotFoundError' || n === 'OverconstrainedError') return 'no camera found';
+    if (n === 'NotReadableError') return 'the camera is being used by another app';
+    if (n === 'NoFrames') return 'the camera didn’t send any picture — try again';
+    return 'couldn’t start the camera';
+  }
+
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && document.visibilityState === 'visible' && !lock) {
+        lock = await navigator.wakeLock.request('screen');
+        lock.addEventListener('release', () => { lock = null; });
+      }
+    } catch (_) {}
+  }
+
+  btn.addEventListener('click', async () => {
+    if (started) return;
+    btn.classList.add('busy');
+    msg.textContent = '';
+    try {
+      if (!gl && !initGL()) throw named('NoWebGL');
+      if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) throw named('Insecure');
+      if (!stream) stream = await openCamera();
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      await firstFrame();
+    } catch (e) {
+      console.warn(e);
+      btn.classList.remove('busy');
+      msg.textContent = errText(e);
+      return;
+    }
+    started = true;
+    document.body.classList.add('on');
+    setTimeout(() => splash.remove(), 800);
+    keepAwake();
+    requestAnimationFrame(frame);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (!started || document.visibilityState !== 'visible') return;
+    if (video.paused) video.play().catch(() => {});
+    keepAwake();
+  });
+})();
+</script>
+</body>
+</html>
