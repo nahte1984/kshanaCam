@@ -31,24 +31,17 @@
 
 <script>
 // ───────── 參數 ─────────
-const CELL    = 5;      // 每格 5×5 CSS px
-const COUNT   = 1000;   // 粒子數
-const TICK    = 40;     // 畫面每隔幾毫秒換一張（跟原本的 GIF 一樣，一秒 25 張）
-const JITTER  = 1.4;    // 每一張粒子在原位附近跳動的範圍（格）——閃爍的程度
-
-// 沙子的分布：低處是一堆沙，上方飄著稀疏的細沙
-const PILE    = 0.45;   // 沙堆裡每格的粒子密度
-const DUST    = 0.012;  // 上方稀疏處每格的粒子密度
-const SURF    = 0.05;   // 沙堆表面的柔軟度（越大越漸層）
+const CELL    = 5;      // 每格 5×5 CSS px，一顆沙佔一格
+const COUNT   = 1000;   // 沙粒數
+const TICK    = 40;     // 每顆沙每隔幾毫秒重新取樣一次相機顏色（一秒 25 次）
 
 // 沙子流動
-const GRAV    = 2200;   // 重力加速度（px/s²）
-const SOFT    = 24;     // 接近落點時開始減速的距離（px）
-const DRAG    = 1.2;    // 空中的阻力
-const SETTLE  = 10;     // 落定時的阻力（越大越不會彈）
-const LATERAL = 0.35;   // 橫向滑動的力（相對重力）
-const FULL    = 0.55;   // 傾斜到這個程度（約 33°）沙堆就完全成形
-const GRAIN   = 6;      // 沙粒直徑（px）：沙子之間至少隔這麼遠，流動時才不會擠成一條線
+const ACC     = 320;    // 重力加速度（格/s²）
+const VMAX    = 180;    // 最快速度（格/s）
+const STILL   = 0.1;    // 傾斜小於這個程度（約 6°）沙子不動
+const FULL    = 0.55;   // 傾斜到這個程度（約 33°）重力全開
+const SLIDE   = 0.6;    // 碰到東西往旁邊滑時保留的速度
+const REPOSE  = 0.02;   // 往下坡滾的最小坡度（越大沙堆越陡、越不容易崩）
 
 const EASE    = 0.12;   // 重力方向跟隨速度（越小越有慣性）
 const SAMPLE  = 160;    // 相機取樣解析度（長邊）
@@ -59,6 +52,15 @@ const PUSH    = 0.13;   // 手指撥開半徑（螢幕短邊的比例）
 const GROW    = 0.3;    // 按下時撥開半徑展開的速度
 
 const WHITE = 0xffffffff, BLACK = 0xff000000;
+// 被擋住時可以去的格子：周圍兩格內，往下坡的方向。
+// 隔一格的要能「從上面滾過去」（中間那格是空的），沙堆才會像真的沙一樣崩塌、攤開。
+const HOPS = [];
+for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+  if (!dx && !dy) continue;
+  const len = Math.hypot(dx, dy);
+  HOPS.push({ dx, dy, ux: dx / len, uy: dy / len, far: Math.abs(dx) === 2 || Math.abs(dy) === 2 });
+}
+let hopA = [], hopB = [];   // 這一幀依坡度排好的候選（兩種平手時的順序，左右各半）
 
 const view  = document.getElementById('view'),  vctx = view.getContext('2d');
 const grid  = document.createElement('canvas'), gctx = grid.getContext('2d');
@@ -66,16 +68,13 @@ const samp  = document.createElement('canvas'), sctx = samp.getContext('2d', { w
 const video = document.getElementById('cam');
 const splash = document.getElementById('splash'), go = document.getElementById('go');
 
-let W, H, cols, rows, N, dpr, pushR, img, buf;
-let U, V;                                   // 每格中心（以螢幕中心為原點）
-const PX = new Float32Array(COUNT), PY = new Float32Array(COUNT);   // 粒子位置
-const VX = new Float32Array(COUNT), VY = new Float32Array(COUNT);   // 粒子速度
-const QU = new Float32Array(COUNT), QV = new Float32Array(COUNT);   // 粒子在沙堆裡的「順位」（深淺、左右）
-const KA = new Float32Array(COUNT), KL = new Float32Array(COUNT);   // 排序用：沿重力、橫向的座標
-const OA = new Int32Array(COUNT), OL = new Int32Array(COUNT);       // 依座標排好的粒子順序
-for (let i = 0; i < COUNT; i++) { OA[i] = i; OL[i] = i; }
-const BAND = 25;                                                    // 每一層幾顆沙子一起排左右
-const BINS = 256, hist = new Float32Array(BINS), cum = new Float64Array(BINS + 1);
+let W, H, cols, rows, N, dpr, pushR, img, buf, occ;   // occ：每格是哪顆沙（-1 = 空）
+const GX = new Int32Array(COUNT), GY = new Int32Array(COUNT);       // 沙粒所在的格子
+const OX = new Float32Array(COUNT), OY = new Float32Array(COUNT);   // 格子內的小數位移（格）
+const VX = new Float32Array(COUNT), VY = new Float32Array(COUNT);   // 速度（格/s）
+const COL = new Uint32Array(COUNT).fill(WHITE);                     // 目前的顏色
+const KEY = new Float32Array(COUNT), ORDER = new Int32Array(COUNT); // 由低到高處理
+for (let i = 0; i < COUNT; i++) ORDER[i] = i;
 let SW = 0, SH = 0, camReady = false, mirror = true;
 let started = false, seeded = false;
 
@@ -95,30 +94,35 @@ function layout() {
 
   img = gctx.createImageData(cols, rows);
   buf = new Uint32Array(img.data.buffer);
-  U = new Float32Array(N); V = new Float32Array(N);
-  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
-    const i = y * cols + x;
-    U[i] = (x + 0.5) * CELL - W / 2;
-    V[i] = (y + 0.5) * CELL - H / 2;
-  }
+  occ = new Int32Array(N).fill(-1);
 
-  if (!seeded) {                                    // 一開始粒子均勻散在整個畫面
-    seeded = true;
-    for (let i = 0; i < COUNT; i++) {
-      PX[i] = (Math.random() - 0.5) * W; PY[i] = (Math.random() - 0.5) * H;
-    }
-  } else {
-    for (let i = 0; i < COUNT; i++) {
-      PX[i] = Math.max(-W / 2, Math.min(W / 2, PX[i]));
-      PY[i] = Math.max(-H / 2, Math.min(H / 2, PY[i]));
+  for (let i = 0; i < COUNT; i++) {
+    let x, y;
+    if (!seeded) { x = (Math.random() * cols) | 0; y = (Math.random() * rows) | 0; }   // 一開始均勻散在整個畫面
+    else { x = Math.min(cols - 1, GX[i]); y = Math.min(rows - 1, GY[i]); }
+    place(i, x, y);
+  }
+  seeded = true;
+}
+
+// 把沙粒放進 (x, y)；有人了就往外找最近的空格
+function place(i, x, y) {
+  for (let r = 0; r < Math.max(cols, rows); r++) {
+    for (let k = 0; k < 8 * Math.max(1, r); k++) {
+      const a = (k / (8 * Math.max(1, r))) * 6.2832;
+      const nx = Math.round(x + Math.cos(a) * r), ny = Math.round(y + Math.sin(a) * r);
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows || occ[ny * cols + nx] !== -1) continue;
+      occ[ny * cols + nx] = i; GX[i] = nx; GY[i] = ny; OX[i] = OY[i] = VX[i] = VY[i] = 0;
+      return true;
     }
   }
+  return false;
 }
 
 // ───────── 重力方向 ─────────
-let gx = 0.35, gy = 0.55;   // 平滑後的重力（螢幕座標，長度 0~1 = 傾斜程度）
-let tx = gx,  ty = gy;      // 目標值
-let dirx = 0.54, diry = 0.84;
+let gx = 0, gy = 0.6;       // 平滑後的重力（螢幕座標，長度 0~1 = 傾斜程度）
+let tx = gx, ty = gy;       // 目標值
+let dirx = 0, diry = 1;
 let sensor = false, lastMouse = -1e9;
 
 function screenAngle() {
@@ -163,111 +167,99 @@ addEventListener('pointerup', release);
 addEventListener('pointercancel', release);
 addEventListener('contextmenu', e => e.preventDefault());
 
-// 把手指圓圈裡的沙子推到圓圈外，並去掉往內的速度
+// 把手指圓圈裡的沙子沿半徑方向推到圈外最近的空格，堆在圓圈邊緣
 function push(fx, fy, r) {
-  fx -= W / 2; fy -= H / 2;
-  const r2 = r * r;
-  for (let i = 0; i < COUNT; i++) {
-    const dx = PX[i] - fx, dy = PY[i] - fy;
-    if (dx > r || dx < -r || dy > r || dy < -r) continue;
-    const d2 = dx * dx + dy * dy;
-    if (d2 >= r2) continue;
-    let ux, uy;
-    if (d2 > 1e-6) { const d = Math.sqrt(d2); ux = dx / d; uy = dy / d; }
-    else { const a = Math.random() * 6.2832; ux = Math.cos(a); uy = Math.sin(a); }
-    const rr = r * (1 + 0.15 * Math.random());
-    PX[i] = fx + ux * rr; PY[i] = fy + uy * rr;
-    const vn = VX[i] * ux + VY[i] * uy;
-    if (vn < 0) { VX[i] -= vn * ux; VY[i] -= vn * uy; }
-  }
-}
-
-// ───────── 沙子的目標分布 ─────────
-// 沿重力方向的位置 t：0 = 最高的角落，1 = 最低的角落。
-// 每格密度 ρ(t) = 稀疏 + (沙堆 − 稀疏) × S 形曲線，沙堆表面的位置由粒子總數決定。
-// 傾斜越小，沙堆越鬆、表面越柔，平放時整個畫面均勻。
-function solveLevels(m) {
-  const ext = Math.abs(W / 2 * dirx) + Math.abs(H / 2 * diry);
-  const ax = dirx / (2 * ext), ay = diry / (2 * ext);
-  hist.fill(0);
-  for (let i = 0; i < N; i++) {                     // 每個 t 有多少格（等高線的長度）
-    let t = 0.5 + U[i] * ax + V[i] * ay;
-    let b = (t * BINS) | 0; b = b < 0 ? 0 : b >= BINS ? BINS - 1 : b;
-    hist[b]++;
-  }
-  const mean = COUNT / N, k = Math.pow(Math.min(1, m / FULL), 0.8);
-  const hi = mean + (PILE - mean) * k, lo = mean - (mean - DUST) * k;
-  const w = SURF + 0.35 * (1 - k);
-  const rho = (t, s) => lo + (hi - lo) / (1 + Math.exp(-(t - s) / w));
-
-  // 找沙堆表面位置 s，讓總量剛好等於 COUNT
-  let a = -1.5, b = 2.5, s = 0.5;
-  if (hi - lo > 1e-4) {
-    for (let it = 0; it < 26; it++) {
-      s = (a + b) / 2;
-      let mass = 0;
-      for (let j = 0; j < BINS; j++) if (hist[j]) mass += hist[j] * rho((j + 0.5) / BINS, s);
-      if (mass > COUNT) a = s; else b = s;
+  const cx = fx / CELL - 0.5, cy = fy / CELL - 0.5, rc = r / CELL;
+  const x0 = Math.max(0, Math.floor(cx - rc)), x1 = Math.min(cols - 1, Math.ceil(cx + rc));
+  const y0 = Math.max(0, Math.floor(cy - rc)), y1 = Math.min(rows - 1, Math.ceil(cy + rc));
+  for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+    const i = occ[y * cols + x];
+    if (i === -1) continue;
+    let dx = x - cx, dy = y - cy;
+    const d = Math.hypot(dx, dy);
+    if (d >= rc) continue;
+    if (d < 1e-3) { const a = Math.random() * 6.2832; dx = Math.cos(a); dy = Math.sin(a); } else { dx /= d; dy /= d; }
+    occ[y * cols + x] = -1;
+    let done = false;
+    for (let s = rc; s < rc + 60 && !done; s += 0.5) {             // 沿半徑往外找第一個空格
+      const nx = Math.round(cx + dx * s), ny = Math.round(cy + dy * s);
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) break;
+      if (occ[ny * cols + nx] === -1) { occ[ny * cols + nx] = i; GX[i] = nx; GY[i] = ny; done = true; }
     }
+    if (!done) place(i, Math.round(cx + dx * (rc + 1)), Math.round(cy + dy * (rc + 1)));
+    OX[i] = OY[i] = VX[i] = VY[i] = 0;
   }
-  cum[0] = 0;
-  for (let j = 0; j < BINS; j++) cum[j + 1] = cum[j] + hist[j] * rho((j + 0.5) / BINS, s);
-  return ext;
 }
 
-// 沙粒之間的碰撞：用格子索引找鄰居，靠太近就各退一半
-let hashW = 0, hashH = 0, head = new Int32Array(0);
-const nextP = new Int32Array(COUNT);
-function separate(hx, hy) {
-  const w = Math.ceil(W / GRAIN) + 2, h = Math.ceil(H / GRAIN) + 2;
-  if (w !== hashW || h !== hashH) { hashW = w; hashH = h; head = new Int32Array(w * h); }
-  head.fill(-1);
-  for (let i = 0; i < COUNT; i++) {
-    const c = (((PY[i] + H / 2) / GRAIN + 1) | 0) * w + (((PX[i] + W / 2) / GRAIN + 1) | 0);
-    nextP[i] = head[c]; head[c] = i;
-  }
-  const d2min = GRAIN * GRAIN;
-  for (let i = 0; i < COUNT; i++) {
-    const gxi = ((PX[i] + W / 2) / GRAIN + 1) | 0, gyi = ((PY[i] + H / 2) / GRAIN + 1) | 0;
-    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) {
-      const cx = gxi + ox, cy = gyi + oy;
-      if (cx < 0 || cy < 0 || cx >= w || cy >= h) continue;
-      for (let j = head[cy * w + cx]; j !== -1; j = nextP[j]) {
-        if (j <= i) continue;
-        let dx = PX[j] - PX[i], dy = PY[j] - PY[i];
-        const d2 = dx * dx + dy * dy;
-        if (d2 >= d2min) continue;
-        let d = Math.sqrt(d2);
-        if (d < 1e-4) { const a = Math.random() * 6.2832; dx = Math.cos(a); dy = Math.sin(a); d = 1; }
-        else { dx /= d; dy /= d; }
-        const s = (GRAIN - d) * 0.5;
-        PX[i] -= dx * s; PY[i] -= dy * s; PX[j] += dx * s; PY[j] += dy * s;
+// ───────── 沙子一步 ─────────
+function tryMove(i, sx, sy) {
+  const nx = GX[i] + sx, ny = GY[i] + sy;
+  if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) return false;
+  const n = ny * cols + nx;
+  if (occ[n] !== -1) return false;
+  occ[GY[i] * cols + GX[i]] = -1; occ[n] = i; GX[i] = nx; GY[i] = ny;
+  return true;
+}
+
+function isFree(x, y) { return x >= 0 && y >= 0 && x < cols && y < rows && occ[y * cols + x] === -1; }
+
+function slide(i) {
+  const list = Math.random() < 0.5 ? hopA : hopB;
+  const x = GX[i], y = GY[i];
+  for (const h of list) {
+    if (!isFree(x + h.dx, y + h.dy)) continue;
+    if (h.far) {
+      // 中間那格：取比較「上面」（逆著重力）的那一格，要是空的才滾得過去
+      const hx = h.dx / 2, hy = h.dy / 2;
+      let mx = Math.round(hx), my = Math.round(hy);
+      if (hx !== mx || hy !== my) {
+        const ax = Math.floor(hx), ay = Math.floor(hy), bx = Math.ceil(hx), by = Math.ceil(hy);
+        if (ax * dirx + ay * diry <= bx * dirx + by * diry) { mx = ax; my = ay; } else { mx = bx; my = by; }
       }
+      if (!isFree(x + mx, y + my)) continue;
+    }
+    return tryMove(i, h.dx, h.dy);
+  }
+  return false;
+}
+
+function stepSand(dt, a) {
+  const ax = dirx * a, ay = diry * a;
+
+  // 依坡度排候選方向（只留往下坡的）；平手時一份偏左、一份偏右
+  const cand = HOPS.map(h => ({ h, s: h.ux * dirx + h.uy * diry, side: h.ux * -diry + h.uy * dirx }))
+                   .filter(c => c.s > REPOSE);
+  hopA = cand.slice().sort((p, q) => (q.s - p.s) || (q.side - p.side)).map(c => c.h);
+  hopB = cand.slice().sort((p, q) => (q.s - p.s) || (p.side - q.side)).map(c => c.h);
+  // 由最低處的沙先動，上面的沙才有空間落下
+  for (let i = 0; i < COUNT; i++) KEY[i] = (GX[i] + OX[i]) * dirx + (GY[i] + OY[i]) * diry;
+  for (let k = 1; k < COUNT; k++) {
+    const o = ORDER[k], v = KEY[o];
+    let j = k - 1;
+    while (j >= 0 && KEY[ORDER[j]] < v) { ORDER[j + 1] = ORDER[j]; j--; }
+    ORDER[j + 1] = o;
+  }
+
+  const damp = a === 0 ? Math.exp(-12 * dt) : 1;
+  for (let k = 0; k < COUNT; k++) {
+    const i = ORDER[k];
+    VX[i] = (VX[i] + ax * dt) * damp; VY[i] = (VY[i] + ay * dt) * damp;
+    const sp = Math.hypot(VX[i], VY[i]);
+    if (sp > VMAX) { VX[i] *= VMAX / sp; VY[i] *= VMAX / sp; }
+    OX[i] += VX[i] * dt; OY[i] += VY[i] * dt;
+
+    for (let guard = 0; guard < 6 && (OX[i] >= 0.5 || OX[i] <= -0.5 || OY[i] >= 0.5 || OY[i] <= -0.5); guard++) {
+      const sx = OX[i] >= 0.5 ? 1 : OX[i] <= -0.5 ? -1 : 0;
+      const sy = OY[i] >= 0.5 ? 1 : OY[i] <= -0.5 ? -1 : 0;
+      if (tryMove(i, sx, sy)) { OX[i] -= sx; OY[i] -= sy; continue; }
+
+      // 被擋住：往下坡最陡、而且有空位的方向滑或滾過去
+      if (slide(i)) { OX[i] = OY[i] = 0; VX[i] *= SLIDE; VY[i] *= SLIDE; break; }
+      // 完全被擋住：停下來，緊靠著旁邊的沙
+      OX[i] = OY[i] = 0; VX[i] = VY[i] = 0;
+      break;
     }
   }
-  for (let i = 0; i < COUNT; i++) {
-    if (PX[i] < -hx) PX[i] = -hx; else if (PX[i] > hx) PX[i] = hx;
-    if (PY[i] < -hy) PY[i] = -hy; else if (PY[i] > hy) PY[i] = hy;
-  }
-}
-
-// 插入排序：上一幀的順序幾乎已經排好，所以很快
-function sortBy(order, key, from, to) {
-  for (let i = from + 1; i < to; i++) {
-    const o = order[i], k = key[o];
-    let j = i - 1;
-    while (j >= from && key[order[j]] > k) { order[j + 1] = order[j]; j--; }
-    order[j + 1] = o;
-  }
-}
-
-// 順位 u（0~1）→ 該粒子要落在哪個 t
-function levelOf(u) {
-  const target = u * cum[BINS];
-  let lo = 0, hi = BINS;
-  while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid + 1] < target) lo = mid + 1; else hi = mid; }
-  const j = Math.min(lo, BINS - 1), span = cum[j + 1] - cum[j];
-  return (j + (span > 0 ? (target - cum[j]) / span : 0.5)) / BINS;
 }
 
 // ───────── 主迴圈 ─────────
@@ -288,55 +280,9 @@ function frame(now) {
   let m = Math.hypot(gx, gy);
   if (m > 1e-4) { dirx = gx / m; diry = gy / m; }
   if (m > 1) m = 1;
+  const a = m < STILL ? 0 : ACC * Math.min(1, (m - STILL) / (FULL - STILL));
 
-  const ext = solveLevels(m);
-  const G = GRAV * (0.2 + 0.8 * Math.min(1, m / FULL));
-  const ex = -diry, ey = dirx;                      // 等高線方向
-  const hx = W / 2 - CELL / 2, hy = H / 2 - CELL / 2;
-  const drag = Math.exp(-DRAG * dt);
-
-  // 依目前位置排順位：越低的沙子落在越低的層；同一層裡越左的落在越左邊。
-  // 沙子之間不會互相穿越，傾斜時整堆一起流過去。
-  for (let i = 0; i < COUNT; i++) {
-    KA[i] = PX[i] * dirx + PY[i] * diry;
-    KL[i] = PX[i] * ex + PY[i] * ey;
-  }
-  sortBy(OA, KA, 0, COUNT);
-  for (let r = 0; r < COUNT; r++) { QU[OA[r]] = (r + 0.5) / COUNT; OL[r] = OA[r]; }
-  for (let b0 = 0; b0 < COUNT; b0 += BAND) {      // 每一層（BAND 顆）各自依左右排
-    const b1 = Math.min(COUNT, b0 + BAND), n = b1 - b0;
-    sortBy(OL, KL, b0, b1);
-    for (let r = b0; r < b1; r++) QV[OL[r]] = (r - b0 + 0.5) / n;
-  }
-
-  for (let i = 0; i < COUNT; i++) {
-    // 這顆沙子的落點：在它那一層等高線上，依左右順位取一點
-    const t = levelOf(QU[i]);
-    const cx = dirx * (t - 0.5) * 2 * ext, cy = diry * (t - 0.5) * 2 * ext;
-    let l0 = -1e9, l1 = 1e9;
-    if (Math.abs(ex) > 1e-6) { let p = (-hx - cx) / ex, q = (hx - cx) / ex; if (p > q) { const z = p; p = q; q = z; } if (p > l0) l0 = p; if (q < l1) l1 = q; }
-    if (Math.abs(ey) > 1e-6) { let p = (-hy - cy) / ey, q = (hy - cy) / ey; if (p > q) { const z = p; p = q; q = z; } if (p > l0) l0 = p; if (q < l1) l1 = q; }
-    const l = l0 <= l1 ? l0 + (l1 - l0) * QV[i] : (l0 + l1) / 2;
-    const dx = cx + l * ex - PX[i], dy = cy + l * ey - PY[i];
-
-    // 沿重力方向：還沒到就往下掉（像沙子），到了就停；橫向慢慢滑
-    const da = dx * dirx + dy * diry, dl = dx * ex + dy * ey;
-    const fa = G * Math.max(-1, Math.min(1, da / SOFT));
-    const fl = G * LATERAL * Math.max(-1, Math.min(1, dl / SOFT));
-    VX[i] += (fa * dirx + fl * ex) * dt;
-    VY[i] += (fa * diry + fl * ey) * dt;
-    const near = Math.exp(-(Math.abs(da) + Math.abs(dl)) / SOFT);
-    const k = drag * Math.exp(-SETTLE * near * dt);
-    VX[i] *= k; VY[i] *= k;
-    PX[i] += VX[i] * dt; PY[i] += VY[i] * dt;
-
-    // 牆壁
-    if (PX[i] < -hx) { PX[i] = -hx; if (VX[i] < 0) VX[i] = 0; } else if (PX[i] > hx) { PX[i] = hx; if (VX[i] > 0) VX[i] = 0; }
-    if (PY[i] < -hy) { PY[i] = -hy; if (VY[i] < 0) VY[i] = 0; } else if (PY[i] > hy) { PY[i] = hy; if (VY[i] > 0) VY[i] = 0; }
-  }
-
-  // 沙粒互相頂住，不重疊
-  for (let it = 0; it < 2; it++) separate(hx, hy);
+  stepSand(dt, a);
 
   // 手指把沙子推開（移動太快時分段推，避免穿過）
   const g = 1 - Math.pow(1 - GROW, f);
@@ -350,44 +296,32 @@ function frame(now) {
     t.lx = t.x; t.ly = t.y;
   }
 
-  // 每 TICK 毫秒換一張畫面
+  // 每 TICK 毫秒，每顆沙重新取樣一次相機顏色（就算位置沒動也一樣）
   tickAcc += ms;
-  if (tickAcc >= TICK) { tickAcc %= TICK; draw(); }
-}
-
-// 畫一張：每顆沙子在原位附近跳一下，亮起時取樣一次相機
-function draw() {
-  let src = null;
-  if (camReady && video.readyState >= 2) {
-    sctx.drawImage(video, 0, 0, SW, SH);
-    src = new Uint32Array(sctx.getImageData(0, 0, SW, SH).data.buffer);
-  }
-  const s = Math.max(W / SW, H / SH), spread = SCATTER * Math.max(SW, SH);
-  const hw = W / 2, hh = H / 2;
+  if (tickAcc >= TICK) { tickAcc %= TICK; sampleColors(); }
 
   buf.fill(BLACK);
-  for (let i = 0; i < COUNT; i++) {
-    const cx = Math.floor((PX[i] + hw) / CELL + (Math.random() + Math.random() - 1) * JITTER);
-    const cy = Math.floor((PY[i] + hh) / CELL + (Math.random() + Math.random() - 1) * JITTER);
-    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) continue;
-
-    let c = WHITE;
-    if (src) {
-      // 在這一格對應的相機位置附近亂數取樣（三角分布：越靠近中心機率越高）
-      const px = (cx + 0.5) * CELL - hw, py = (cy + 0.5) * CELL - hh;
-      let sx = px / s + SW / 2, sy = py / s + SH / 2;
-      if (mirror) sx = SW - sx;
-      sx += (Math.random() + Math.random() - 1) * spread;
-      sy += (Math.random() + Math.random() - 1) * spread;
-      sx = sx < 0 ? 0 : sx >= SW ? SW - 1 : sx;
-      sy = sy < 0 ? 0 : sy >= SH ? SH - 1 : sy;
-      c = src[(sy | 0) * SW + (sx | 0)] | BLACK;
-    }
-    buf[cy * cols + cx] = c;
-  }
-
+  for (let i = 0; i < COUNT; i++) buf[GY[i] * cols + GX[i]] = COL[i];
   gctx.putImageData(img, 0, 0);
   vctx.drawImage(grid, 0, 0, view.width, view.height);
+}
+
+function sampleColors() {
+  if (!camReady || video.readyState < 2) return;
+  sctx.drawImage(video, 0, 0, SW, SH);
+  const src = new Uint32Array(sctx.getImageData(0, 0, SW, SH).data.buffer);
+  const s = Math.max(W / SW, H / SH), spread = SCATTER * Math.max(SW, SH);
+  for (let i = 0; i < COUNT; i++) {
+    // 在這一格對應的相機位置附近亂數取樣（三角分布：越靠近中心機率越高）
+    const px = (GX[i] + 0.5) * CELL - W / 2, py = (GY[i] + 0.5) * CELL - H / 2;
+    let sx = px / s + SW / 2, sy = py / s + SH / 2;
+    if (mirror) sx = SW - sx;
+    sx += (Math.random() + Math.random() - 1) * spread;
+    sy += (Math.random() + Math.random() - 1) * spread;
+    sx = sx < 0 ? 0 : sx >= SW ? SW - 1 : sx;
+    sy = sy < 0 ? 0 : sy >= SH ? SH - 1 : sy;
+    COL[i] = src[(sy | 0) * SW + (sx | 0)] | BLACK;
+  }
 }
 
 // ───────── 相機 ─────────
