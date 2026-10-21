@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
 <meta name="theme-color" content="#000">
-<title>kshanaCam</title>
+<title>mandalaCam</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Raleway+Dots&display=block" rel="stylesheet">
@@ -12,10 +12,13 @@
   html,body{margin:0;height:100%;background:#000;overflow:hidden;overscroll-behavior:none;touch-action:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;-webkit-tap-highlight-color:transparent}
   #view{position:fixed;left:0;top:0;display:block;touch-action:none}
   #splash{position:fixed;top:0;right:0;bottom:0;left:0;z-index:10;display:flex;align-items:center;justify-content:center;background:#000;cursor:pointer;transition:opacity .5s}
+  #splash[hidden]{display:none}
   #splash.wait{pointer-events:none}
   #splash.wait #go{opacity:.5}
-  #splash.out{opacity:0}
-  #go{position:relative;font-family:'Raleway Dots',sans-serif;font-weight:400;font-size:min(62px,16.5vw);line-height:normal;color:#fff;background:none;border:0;padding:0;margin:0;white-space:nowrap;cursor:pointer;transition:opacity .2s}
+  #splash.out{opacity:0;pointer-events:none}
+  #splash.in{transition:opacity 1s}
+  /* mandalaCam 比 kshanaCam 寬約 14%，字級從 62px 降到 54px，保持跟原本一樣的寬度 */
+  #go{position:relative;font-family:'Raleway Dots',sans-serif;font-weight:400;font-size:min(54px,14.4vw);line-height:normal;color:#fff;background:none;border:0;padding:0;margin:0;white-space:nowrap;cursor:pointer;transition:opacity .2s}
   /* 點點底線：用字型本身的單位畫（1em = 1000），點直徑 20、間距 37，跟 Raleway Dots 的底線字元一樣 */
   #go .ul{position:absolute;left:0;top:1.05em;width:100%;height:.02em;overflow:visible;pointer-events:none}
   #splash:active #go{opacity:.5}
@@ -26,7 +29,7 @@
 <canvas id="view"></canvas>
 <video id="cam" playsinline muted autoplay></video>
 <div id="splash">
-  <button id="go" aria-label="開始 kshanaCam（需要相機與動作感測權限）">kshanaCam<svg class="ul" viewBox="0 0 5309 20" preserveAspectRatio="none" aria-hidden="true"></svg></button>
+  <button id="go" aria-label="開始 mandalaCam（需要相機與動作感測權限）">mandalaCam<svg class="ul" viewBox="0 0 6058 20" preserveAspectRatio="none" aria-hidden="true"></svg></button>
 </div>
 
 <script>
@@ -51,6 +54,12 @@ const SCATTER = 0.07;   // 亂數取樣的範圍（相機畫面長邊的比例�
 // 手指撥開
 const PUSH    = 0.13;   // 手指撥開半徑（螢幕短邊的比例）
 const GROW    = 0.3;    // 按下時撥開半徑展開的速度
+
+// 填滿之後：點一下，沙全部往下掉出畫面 → 全黑 → splash 淡入 → 點擊開始下一輪
+const FULL_SLACK = 0.002; // 剩不到這個比例的空格就算填滿（避免卡在最後幾格）
+const DROP_G  = 900;    // 掉出畫面時的重力（格/s²）
+const STAGGER = 0.45;   // 由下往上依序鬆脫的時間差（秒）：最上面的沙晚這麼久才開始掉
+const DARK    = 2000;   // 沙掉光之後全黑的時間（毫秒）
 
 const WHITE = 0xffffffff, BLACK = 0xff000000;
 // 被擋住時可以去的格子：周圍兩格內，往下坡的方向。
@@ -78,6 +87,8 @@ let COL;             // 目前的顏色
 let KEY, ORDER;      // 由低到高處理
 let count = 0;       // 目前畫面上有幾顆沙（一開始是 0）
 let SW = 0, SH = 0, camReady = false, mirror = true, lastSrc = null;
+// 狀態：'splash' 等待點擊 → 'run' 落沙、互動 → 'drop' 沙往下掉出畫面 → 'dark' 全黑 → 'splash'
+let state = 'splash', dropT = 0, darkUntil = 0;
 let started = false;
 
 // ───────── 版面：切成 5px 格子 ─────────
@@ -171,9 +182,12 @@ addEventListener('deviceorientation', e => {
 const touches = new Map();   // pointerId → { x, y, lx, ly, r }
 
 addEventListener('pointerdown', e => {
-  if (!started) return;
+  if (state !== 'run') return;
+  if (isFull()) { startDrop(); return; }          // 填滿了：點一下，沙全部掉下去
   touches.set(e.pointerId, { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, r: 0 });
 });
+
+function isFull() { return count >= N - Math.ceil(N * FULL_SLACK); }
 
 addEventListener('pointermove', e => {
   const t = touches.get(e.pointerId);
@@ -294,6 +308,13 @@ function frame(now) {
   const ms = Math.min(50, now - last); last = now;
   const dt = ms / 1000, f = ms / 16.667;
 
+  if (state === 'splash') return;
+  if (state === 'dark') {                           // 全黑兩秒，然後 splash 淡入
+    if (now >= darkUntil) showSplash();
+    return;
+  }
+  if (state === 'drop') { stepDrop(dt, ms); return; }
+
   // 沒有陀螺儀也沒動滑鼠時：重力緩慢繞圈，讓畫面保持活著
   if (!sensor && now - lastMouse > 3000) {
     const t = now * 0.00022;
@@ -331,10 +352,63 @@ function frame(now) {
   tickAcc += ms;
   if (tickAcc >= TICK) { tickAcc %= TICK; sampleColors(); }
 
+  render();
+}
+
+function render() {
   buf.fill(BLACK);
   for (let i = 0; i < count; i++) buf[GY[i] * cols + GX[i]] = COL[i];
   gctx.putImageData(img, 0, 0);
   vctx.drawImage(grid, 0, 0, view.width, view.height);
+}
+
+// ───────── 填滿之後：沙往下掉出畫面 ─────────
+// 用 OY 當連續的 y、VY 當速度、OX 當開始掉的延遲、VX 當每顆略為不同的重量
+function startDrop() {
+  state = 'drop'; dropT = 0; touches.clear();
+  for (let i = 0; i < count; i++) {
+    OY[i] = GY[i]; VY[i] = 0;
+    OX[i] = (rows - 1 - GY[i]) / rows * STAGGER + Math.random() * 0.12;   // 下面的先鬆脫
+    VX[i] = 0.85 + Math.random() * 0.3;
+  }
+}
+
+function stepDrop(dt, ms) {
+  dropT += dt;
+  for (let i = 0; i < count; i++) {
+    if (dropT < OX[i]) continue;
+    VY[i] += DROP_G * VX[i] * dt;
+    OY[i] += VY[i] * dt;
+    if (OY[i] >= rows) {                            // 掉出畫面：拿掉（跟最後一顆交換）
+      const j = --count;
+      GX[i] = GX[j]; GY[i] = GY[j]; OX[i] = OX[j]; OY[i] = OY[j]; VX[i] = VX[j]; VY[i] = VY[j]; COL[i] = COL[j];
+      i--; continue;
+    }
+    GY[i] = OY[i] | 0;
+  }
+  tickAcc += ms;                                    // 掉落途中照樣每 40ms 取樣
+  if (tickAcc >= TICK) { tickAcc %= TICK; sampleColors(); }
+  render();
+  if (count === 0) { state = 'dark'; darkUntil = performance.now() + DARK; }
+}
+
+// ───────── splash ─────────
+function showSplash() {
+  state = 'splash';
+  splash.classList.remove('wait');
+  splash.classList.add('out', 'in');                // 先設成透明，下一幀再淡入
+  splash.hidden = false;
+  requestAnimationFrame(() => requestAnimationFrame(() => splash.classList.remove('out')));
+}
+
+// 開始新的一輪：畫面清空，重新一秒 75 顆往下落
+function beginCycle() {
+  count = 0; occ.fill(-1); pending = 0; spawnAcc = 0; touches.clear();
+  buf.fill(BLACK); gctx.putImageData(img, 0, 0); vctx.drawImage(grid, 0, 0, view.width, view.height);
+  state = 'run';
+  splash.classList.remove('in');
+  splash.classList.add('out');
+  setTimeout(() => { if (state !== 'splash') splash.hidden = true; }, 600);
 }
 
 function sampleColors() {
@@ -373,7 +447,8 @@ video.addEventListener('resize', setupSample);
 let starting = false;
 splash.addEventListener('click', async e => {
   e.stopPropagation();
-  if (starting || started) return;
+  if (state !== 'splash' || starting) return;
+  if (started) { beginCycle(); return; }          // 第二輪起：權限已經有了，直接開始
   starting = true;
   splash.classList.add('wait');
   const DOE = window.DeviceOrientationEvent;
@@ -395,11 +470,10 @@ splash.addEventListener('click', async e => {
     video.play().catch(() => {});
   }
 
-  started = true;
+  started = true; starting = false;
   last = performance.now();
   requestAnimationFrame(frame);
-  splash.classList.add('out');
-  setTimeout(() => splash.remove(), 600);
+  beginCycle();
   keepAwake();
 });
 
@@ -411,20 +485,28 @@ async function keepAwake() {
 document.addEventListener('visibilitychange', () => { if (started && document.visibilityState === 'visible') keepAwake(); });
 
 let rt;
-addEventListener('resize', () => { clearTimeout(rt); rt = setTimeout(() => { touches.clear(); layout(); }, 120); });
+addEventListener('resize', () => {
+  clearTimeout(rt);
+  rt = setTimeout(() => { touches.clear(); if (state === 'drop') count = 0; layout(); buildUnderline(); }, 120);
+});
 
-// splash 標題的點點底線：「kshanaCam」字寬 5309 單位，排 143 個點、置中
-(() => {
+// splash 標題的點點底線：依標題實際字寬（字型單位，1em = 1000）排點、置中
+function buildUnderline() {
   const svg = go.querySelector('.ul'), NS = 'http://www.w3.org/2000/svg';
-  const WIDTH = 5309, D = 20, GAP = 37;
+  const fs = parseFloat(getComputedStyle(go).fontSize), w = go.getBoundingClientRect().width;
+  const WIDTH = w > 0 && fs > 0 ? Math.round(w / fs * 1000) : 6058, D = 20, GAP = 37;
   const n = Math.floor((WIDTH - D) / GAP) + 1;
   const x0 = (WIDTH - ((n - 1) * GAP + D)) / 2 + D / 2;
+  svg.setAttribute('viewBox', `0 0 ${WIDTH} ${D}`);
+  svg.replaceChildren();
   for (let i = 0; i < n; i++) {
     const c = document.createElementNS(NS, 'circle');
     c.setAttribute('cx', x0 + i * GAP); c.setAttribute('cy', D / 2); c.setAttribute('r', D / 2); c.setAttribute('fill', '#fff');
     svg.appendChild(c);
   }
-})();
+}
+buildUnderline();
+if (document.fonts) document.fonts.ready.then(buildUnderline);
 
 layout();   // 先切好格子；粒子要等按下 splash、取得權限後才開始
 </script>
