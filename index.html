@@ -57,8 +57,9 @@ const GROW    = 0.3;    // 按下時撥開半徑展開的速度
 
 // 填滿之後：點一下，沙全部往下掉出畫面 → 全黑 → splash 淡入 → 點擊開始下一輪
 const FULL_SLACK = 0.002; // 剩不到這個比例的空格就算填滿（避免卡在最後幾格）
-const DROP_G  = 900;    // 掉出畫面時的重力（格/s²）
-const STAGGER = 0.45;   // 由下往上依序鬆脫的時間差（秒）：最上面的沙晚這麼久才開始掉
+const DROP_TIME = 3;    // 從點下去到沙全部掉光的時間（秒）；掉落的重力依畫面大小自動算
+const STAGGER = 0.9;    // 由低往高依序鬆脫的時間差（秒）：離出口最遠的沙晚這麼久才開始掉
+const LOOSE   = 0.15;   // 每顆鬆脫時間的隨機差（秒）
 const DARK    = 2000;   // 沙掉光之後全黑的時間（毫秒）
 
 const WHITE = 0xffffffff, BLACK = 0xff000000;
@@ -89,6 +90,7 @@ let count = 0;       // 目前畫面上有幾顆沙（一開始是 0）
 let SW = 0, SH = 0, camReady = false, mirror = true, lastSrc = null;
 // 狀態：'splash' 等待點擊 → 'run' 落沙、互動 → 'drop' 沙往下掉出畫面 → 'dark' 全黑 → 'splash'
 let state = 'splash', dropT = 0, darkUntil = 0;
+let tilt = 0, dropX = 0, dropY = 1, dropG = 100;   // 目前傾斜程度；掉出畫面的方向與重力
 let started = false;
 
 // ───────── 版面：切成 5px 格子 ─────────
@@ -124,21 +126,27 @@ function layout() {
   }
 }
 
-// 新的一剎那：從畫面最上方一排的隨機位置落下一顆沙
+// 新的一剎那：從「物理上最高的那一邊」的隨機位置落下一顆沙。
+// 手機直拿時就是畫面最上方；倒過來拿就從畫面底部生出、往上掉，側拿就從側邊。
 function spawn() {
   if (count >= N) return false;
-  const start = (Math.random() * cols) | 0;
-  for (let k = 0; k < cols; k++) {
-    const x = (start + k) % cols;
-    if (occ[x] !== -1) continue;
+  const vertical = Math.abs(diry) >= Math.abs(dirx);
+  const len = vertical ? cols : rows;
+  const start = (Math.random() * len) | 0;
+  for (let k = 0; k < len; k++) {
+    const p = (start + k) % len;
+    const x = vertical ? p : (dirx >= 0 ? 0 : cols - 1);
+    const y = vertical ? (diry >= 0 ? 0 : rows - 1) : p;
+    const c = y * cols + x;
+    if (occ[c] !== -1) continue;
     const i = count++;
-    occ[x] = i; GX[i] = x; GY[i] = 0;
+    occ[c] = i; GX[i] = x; GY[i] = y;
     OX[i] = OY[i] = VX[i] = VY[i] = 0;
     ORDER[i] = i;
-    COL[i] = lastSrc ? sampleOne(x, 0, lastSrc) : WHITE;   // 亮起的這一刻就取樣一次
+    COL[i] = lastSrc ? sampleOne(x, y, lastSrc) : WHITE;   // 亮起的這一刻就取樣一次
     return true;
   }
-  return false;   // 最上面一排都被堵住了
+  return false;   // 最高那一邊都被堵住了
 }
 
 // 把沙粒放進 (x, y)；有人了就往外找最近的空格
@@ -326,6 +334,7 @@ function frame(now) {
   let m = Math.hypot(gx, gy);
   if (m > 1e-4) { dirx = gx / m; diry = gy / m; }
   if (m > 1) m = 1;
+  tilt = m;
   const a = m < STILL ? 0 : ACC * Math.min(1, (m - STILL) / (FULL - STILL));
 
   // 每一剎那落下一顆沙（一秒 75 顆）
@@ -362,29 +371,44 @@ function render() {
   vctx.drawImage(grid, 0, 0, view.width, view.height);
 }
 
-// ───────── 填滿之後：沙往下掉出畫面 ─────────
-// 用 OY 當連續的 y、VY 當速度、OX 當開始掉的延遲、VX 當每顆略為不同的重量
+// ───────── 填滿之後：沙順著重力掉出畫面 ─────────
+// 用 KEY/OY 當連續的 x/y、VY 當速度、OX 當開始掉的延遲、VX 當每顆略為不同的重量
+function exitDist(x, y) {                           // 沿掉落方向走多遠會離開畫面（格）
+  const tx = dropX > 1e-6 ? (cols - x) / dropX : dropX < -1e-6 ? (x + 1) / -dropX : Infinity;
+  const ty = dropY > 1e-6 ? (rows - y) / dropY : dropY < -1e-6 ? (y + 1) / -dropY : Infinity;
+  return Math.min(tx, ty);
+}
+
 function startDrop() {
   state = 'drop'; dropT = 0; touches.clear();
+  // 往重力方向掉（手機平放時就往畫面下方）
+  if (tilt >= STILL) { dropX = dirx; dropY = diry; } else { dropX = 0; dropY = 1; }
+  let far = 1;
   for (let i = 0; i < count; i++) {
-    OY[i] = GY[i]; VY[i] = 0;
-    OX[i] = (rows - 1 - GY[i]) / rows * STAGGER + Math.random() * 0.12;   // 下面的先鬆脫
+    KEY[i] = GX[i]; OY[i] = GY[i]; VY[i] = 0;
     VX[i] = 0.85 + Math.random() * 0.3;
+    far = Math.max(far, exitDist(GX[i], GY[i]));
   }
+  for (let i = 0; i < count; i++)                    // 靠近出口的先鬆脫
+    OX[i] = exitDist(GX[i], GY[i]) / far * STAGGER + Math.random() * LOOSE;
+  // 讓離出口最遠、最輕的那顆剛好在 DROP_TIME 秒時掉出去
+  const fall = DROP_TIME - STAGGER - LOOSE;
+  dropG = 2 * far / (fall * fall * 0.85);
 }
 
 function stepDrop(dt, ms) {
   dropT += dt;
   for (let i = 0; i < count; i++) {
     if (dropT < OX[i]) continue;
-    VY[i] += DROP_G * VX[i] * dt;
-    OY[i] += VY[i] * dt;
-    if (OY[i] >= rows) {                            // 掉出畫面：拿掉（跟最後一顆交換）
+    VY[i] += dropG * VX[i] * dt;
+    KEY[i] += dropX * VY[i] * dt; OY[i] += dropY * VY[i] * dt;
+    const x = Math.floor(KEY[i]), y = Math.floor(OY[i]);
+    if (x < 0 || y < 0 || x >= cols || y >= rows) { // 掉出畫面：拿掉（跟最後一顆交換）
       const j = --count;
-      GX[i] = GX[j]; GY[i] = GY[j]; OX[i] = OX[j]; OY[i] = OY[j]; VX[i] = VX[j]; VY[i] = VY[j]; COL[i] = COL[j];
+      GX[i] = GX[j]; GY[i] = GY[j]; KEY[i] = KEY[j]; OX[i] = OX[j]; OY[i] = OY[j]; VX[i] = VX[j]; VY[i] = VY[j]; COL[i] = COL[j];
       i--; continue;
     }
-    GY[i] = OY[i] | 0;
+    GX[i] = x; GY[i] = y;
   }
   tickAcc += ms;                                    // 掉落途中照樣每 40ms 取樣
   if (tickAcc >= TICK) { tickAcc %= TICK; sampleColors(); }
