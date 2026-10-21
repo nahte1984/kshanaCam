@@ -19,8 +19,6 @@
   /* 點點底線：用字型本身的單位畫（1em = 1000），點直徑 20、間距 37，跟 Raleway Dots 的底線字元一樣 */
   #go .ul{position:absolute;left:0;top:1.05em;width:100%;height:.02em;overflow:visible;pointer-events:none}
   #splash:active #go{opacity:.5}
-  #tag{position:fixed;left:12px;bottom:calc(12px + env(safe-area-inset-bottom));color:#fff;background:#000;font:11px/1.4 ui-monospace,Menlo,Consolas,monospace;padding:3px 7px;opacity:0;transition:opacity .6s;pointer-events:none}
-  #tag.show{opacity:1}
   #cam{position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none}
 </style>
 </head>
@@ -30,17 +28,17 @@
 <div id="splash">
   <button id="go" aria-label="開始 kshanaCam（需要相機與動作感測權限）">kshanaCam<svg class="ul" viewBox="0 0 5309 20" preserveAspectRatio="none" aria-hidden="true"></svg></button>
 </div>
-<div id="tag"></div>
 
 <script>
 // ───────── 參數 ─────────
-const CELL   = 5;      // 每格 5×5 CSS px
-const MASS   = 0.18;   // 平均亮點比例（粒子總量，傾斜時大致守恆）
-const FLOOR  = 0.015;  // 最稀疏處仍保留的機率底值
-const KMAX   = 4;      // 傾斜到底時的曲線次方（越大越往低處堆）
-const CHURN  = 0.07;   // 每幀重新擲骰的格子比例（閃爍速度）
-const EASE   = 0.12;   // 重力跟隨速度（越小越有慣性）
-const SAMPLE = 160;    // 相機取樣解析度（長邊）
+const CELL    = 5;      // 每格 5×5 CSS px
+const LIT     = 75;     // 每一剎那畫面上亮著的格子數
+const KSHANA  = 1000 / 75; // 一剎那（毫秒）：一秒 75 剎那，每一剎那換一批亮點
+const FLOOR   = 0.055;  // 最稀疏處的相對密度（整個畫面平均 = 1）
+const KMAX    = 6;      // 傾斜到底時的曲線次方（越大越往低處堆，疏密差越大）
+const EASE    = 0.12;   // 重力跟隨速度（越小越有慣性）
+const SAMPLE  = 160;    // 相機取樣解析度（長邊）
+const SCATTER = 0.07;   // 亂數取樣的範圍（相機畫面長邊的比例）；越小臉越清楚
 
 // 手指撥開
 const PUSH   = 0.13;   // 手指撥開半徑（螢幕短邊的比例）
@@ -54,17 +52,17 @@ const view  = document.getElementById('view'),  vctx = view.getContext('2d');
 const grid  = document.createElement('canvas'), gctx = grid.getContext('2d');
 const samp  = document.createElement('canvas'), sctx = samp.getContext('2d', { willReadFrequently: true });
 const video = document.getElementById('cam');
-const splash = document.getElementById('splash'), go = document.getElementById('go'), tag = document.getElementById('tag');
-const mobile = matchMedia('(pointer:coarse)').matches;
+const splash = document.getElementById('splash'), go = document.getElementById('go');
 
 let W, H, cols, rows, N, dpr, pushR;
-let U, V, thr, on, col, mapIdx, img, buf;
+let U, V, cdf, stamp, mapX, mapY, img, buf;
 let OX, OY, RAD;        // 每個粒子離開原位的位移，以及各自被推到的半徑倍率
-let SW = 0, SH = 0, camReady = false, hadCam = false, mirror = false;
-let mode = 0;           // 0 = 亂數取樣, 1 = 對位取樣
+const pick = new Int32Array(LIT), pickCol = new Uint32Array(LIT);
+let picked = 0, gen = 0, kAcc = KSHANA;   // kAcc：距離上一剎那累積的時間（起始就換第一批）
+let SW = 0, SH = 0, camReady = false, mirror = true;
 let started = false;
 
-// ───────── 版面：切成最多個 5px 格 ─────────
+// ───────── 版面：切成格子 ─────────
 function layout() {
   W = innerWidth; H = innerHeight;
   dpr = Math.min(devicePixelRatio || 1, 3);
@@ -81,30 +79,27 @@ function layout() {
   img = gctx.createImageData(cols, rows);
   buf = new Uint32Array(img.data.buffer);
   U = new Float32Array(N); V = new Float32Array(N);
-  thr = new Float32Array(N); on = new Uint8Array(N);
-  col = new Uint32Array(N); mapIdx = new Int32Array(N);
+  cdf = new Float64Array(N); stamp = new Uint32Array(N); picked = 0; kAcc = KSHANA;
+  mapX = new Float32Array(N); mapY = new Float32Array(N);
   OX = new Float32Array(N); OY = new Float32Array(N); RAD = new Float32Array(N);
 
   for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
     const i = y * cols + x;
     U[i] = (x + 0.5) * CELL - W / 2;
     V[i] = (y + 0.5) * CELL - H / 2;
-    thr[i] = Math.random();
     RAD[i] = 1 + RIM * Math.pow(Math.random(), 1.6);   // 多數堆在洞口邊緣，少數散得遠一點
   }
   buildMap();
 }
 
-// 對位模式：每一格對應到相機畫面的哪個像素（cover 裁切，前鏡頭鏡像）
+// 每一格在相機畫面上的對應位置（cover 裁切，自拍鏡頭左右鏡像）；亂數取樣以這裡為中心
 function buildMap() {
   if (!SW || !U) return;
   const s = Math.max(W / SW, H / SH);
   for (let i = 0; i < N; i++) {
-    let vx = Math.floor(U[i] / s + SW / 2), vy = Math.floor(V[i] / s + SH / 2);
-    vx = vx < 0 ? 0 : vx >= SW ? SW - 1 : vx;
-    vy = vy < 0 ? 0 : vy >= SH ? SH - 1 : vy;
-    if (mirror) vx = SW - 1 - vx;
-    mapIdx[i] = vy * SW + vx;
+    const vx = U[i] / s + SW / 2, vy = V[i] / s + SH / 2;
+    mapX[i] = mirror ? SW - vx : vx;
+    mapY[i] = vy;
   }
 }
 
@@ -131,23 +126,12 @@ addEventListener('deviceorientation', e => {
   ty = px * s + py * c;
 });
 
-// ───────── 手指：按住撥開亮點，點兩下切換取樣 ─────────
+// ───────── 手指：按住撥開亮點 ─────────
 const touches = new Map();   // pointerId → { x, y, lx, ly, r }
-let lastTap = { t: -1e9, x: 0, y: 0 };
 
 addEventListener('pointerdown', e => {
   if (!started) return;
   touches.set(e.pointerId, { x: e.clientX, y: e.clientY, lx: e.clientX, ly: e.clientY, r: 0 });
-
-  const now = performance.now();
-  if (now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 50) {
-    mode ^= 1;
-    on.fill(0);                                     // 全部重新取樣
-    flash(mode ? '對位取樣' : '亂數取樣');
-    lastTap.t = -1e9;
-  } else {
-    lastTap = { t: now, x: e.clientX, y: e.clientY };
-  }
 });
 
 addEventListener('pointermove', e => {
@@ -190,7 +174,8 @@ function push(fx, fy, r) {
 let last = performance.now();
 function frame(now) {
   requestAnimationFrame(frame);
-  const f = Math.min(3, (now - last) / 16.667); last = now;   // 以 60fps 為基準的幀倍率
+  const dt = Math.min(50, now - last); last = now;
+  const f = dt / 16.667;                            // 以 60fps 為基準的幀倍率
 
   // 沒有陀螺儀也沒動滑鼠時：重力緩慢繞圈，讓畫面保持活著
   if (!sensor && now - lastMouse > 3000) {
@@ -204,24 +189,12 @@ function frame(now) {
   if (m > 1e-4) { dirx = gx / m; diry = gy / m; }
   if (m > 1) m = 1;
 
-  // 平放 → K=0（均勻）；傾斜到底 → K=KMAX（粒子堆到低處）
-  const K   = KMAX * Math.pow(m, 1.2);
-  const amp = (MASS - FLOOR) * (K + 1);           // 讓總量大致不變
-  const ext = Math.abs(W / 2 * dirx) + Math.abs(H / 2 * diry);
-  const ax = dirx / (2 * ext), ay = diry / (2 * ext);
-
-  // 取樣相機
-  let src = null, n = 0;
-  if (camReady && video.readyState >= 2) {
-    sctx.drawImage(video, 0, 0, SW, SH);
-    src = new Uint32Array(sctx.getImageData(0, 0, SW, SH).data.buffer);
-    n = src.length;
-    if (!hadCam) { hadCam = true; on.fill(0); }   // 相機第一幀到了：把先前的白點全部重新取樣
+  // 每過一剎那，換一批亮點（60Hz 螢幕一幀 16.7ms ＞ 一剎那 13.3ms，所以每一幀都換）
+  kAcc += dt;
+  if (kAcc >= KSHANA) {
+    kAcc %= KSHANA;
+    newKshana(m);
   }
-
-  // 一部分格子重新擲骰（下一次亮起就是新的一次取樣）
-  const k = (N * CHURN * f) | 0;
-  for (let j = 0; j < k; j++) { const i = (Math.random() * N) | 0; thr[i] = Math.random(); on[i] = 0; }
 
   // 位移慢慢回到原位
   const keep = Math.pow(1 - RELAX, f);
@@ -243,26 +216,64 @@ function frame(now) {
     t.lx = t.x; t.ly = t.y;
   }
 
-  // 畫：亮點畫在「原位 + 位移」的格子上
+  // 畫：這一剎那的亮點，畫在「原位 + 位移」的格子上
   buf.fill(BLACK);
   const hw = W / 2, hh = H / 2;
-  for (let i = 0; i < N; i++) {
-    let tt = 0.5 + U[i] * ax + V[i] * ay;           // 0 = 高處, 1 = 低處
-    tt = tt < 0 ? 0 : tt > 1 ? 1 : tt;
-    const p = FLOOR + amp * Math.pow(tt, K);
-    if (thr[i] >= p) { on[i] = 0; continue; }
-    if (!on[i]) {                                   // 亮起的瞬間取樣一次
-      on[i] = 1;
-      col[i] = n ? (src[mode ? mapIdx[i] : (Math.random() * n) | 0] | BLACK) : WHITE;
-    }
-    if (OX[i] === 0 && OY[i] === 0) { buf[i] = col[i]; continue; }
+  for (let j = 0; j < picked; j++) {
+    const i = pick[j];
     const cx = Math.floor((U[i] + OX[i] + hw) / CELL);
     const cy = Math.floor((V[i] + OY[i] + hh) / CELL);
-    if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) buf[cy * cols + cx] = col[i];
+    if (cx >= 0 && cx < cols && cy >= 0 && cy < rows) buf[cy * cols + cx] = pickCol[j];
   }
 
   gctx.putImageData(img, 0, 0);
   vctx.drawImage(grid, 0, 0, view.width, view.height);
+}
+
+// 新的一剎那：依重力的疏密分布，從所有格子裡抽出 LIT 格點亮，每一格亮起時取樣一次相機
+function newKshana(m) {
+  // 平放 → K=0（均勻）；傾斜到底 → K=KMAX（粒子堆到低處）
+  const K = KMAX * Math.pow(m, 1.2);
+  const ext = Math.abs(W / 2 * dirx) + Math.abs(H / 2 * diry);
+  const ax = dirx / (2 * ext), ay = diry / (2 * ext);
+  const amp = (1 - FLOOR) * (K + 1);              // 平均密度維持 1
+
+  let acc = 0;
+  for (let i = 0; i < N; i++) {
+    let t = 0.5 + U[i] * ax + V[i] * ay;            // 0 = 高處, 1 = 低處
+    t = t < 0 ? 0 : t > 1 ? 1 : t;
+    acc += FLOOR + amp * Math.pow(t, K);
+    cdf[i] = acc;
+  }
+
+  // 相機這一剎那的畫面
+  let src = null;
+  if (camReady && video.readyState >= 2) {
+    sctx.drawImage(video, 0, 0, SW, SH);
+    src = new Uint32Array(sctx.getImageData(0, 0, SW, SH).data.buffer);
+  }
+  const spread = SCATTER * Math.max(SW, SH);      // 亂數取樣的範圍（相機畫面像素）
+
+  gen++; picked = 0;
+  const want = Math.min(LIT, N);
+  for (let tries = 0; picked < want && tries < want * 8; tries++) {
+    // 依累積分布抽一格（二分搜尋）
+    const r = Math.random() * acc;
+    let lo = 0, hi = N - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < r) lo = mid + 1; else hi = mid; }
+    if (stamp[lo] === gen) continue;                // 同一剎那不重複
+    stamp[lo] = gen;
+    pick[picked] = lo;
+    if (src) {
+      // 在這一格對應的相機位置附近亂數取樣（三角分布：越靠近中心機率越高）
+      let sx = mapX[lo] + (Math.random() + Math.random() - 1) * spread;
+      let sy = mapY[lo] + (Math.random() + Math.random() - 1) * spread;
+      sx = sx < 0 ? 0 : sx >= SW ? SW - 1 : sx;
+      sy = sy < 0 ? 0 : sy >= SH ? SH - 1 : sy;
+      pickCol[picked] = src[(sy | 0) * SW + (sx | 0)] | BLACK;
+    } else pickCol[picked] = WHITE;
+    picked++;
+  }
 }
 
 // ───────── 相機 ─────────
@@ -290,7 +301,7 @@ splash.addEventListener('click', async e => {
     ? DOE.requestPermission().catch(() => 'denied') : Promise.resolve('granted');
   const camP = (navigator.mediaDevices && navigator.mediaDevices.getUserMedia)
     ? navigator.mediaDevices.getUserMedia({
-        video: { facingMode: mobile ? { ideal: 'environment' } : 'user', width: { ideal: 640 }, height: { ideal: 480 } },
+        video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } },
         audio: false
       }).catch(() => null)
     : Promise.resolve(null);
@@ -299,7 +310,8 @@ splash.addEventListener('click', async e => {
   const [motion, stream] = await Promise.all([motionP, camP]);
   if (stream) {
     const st = stream.getVideoTracks()[0]?.getSettings?.() || {};
-    mirror = st.facingMode ? st.facingMode === 'user' : !mobile;
+    mirror = st.facingMode ? st.facingMode === 'user' : true;   // 自拍鏡頭像鏡子一樣左右相反
+    buildMap();
     video.srcObject = stream;
     video.play().catch(() => {});
   }
@@ -309,20 +321,8 @@ splash.addEventListener('click', async e => {
   requestAnimationFrame(frame);
   splash.classList.add('out');
   setTimeout(() => splash.remove(), 600);
-
-  const notes = [];
-  if (!stream) notes.push('沒有相機：以白點顯示');
-  if (motion !== 'granted') notes.push('沒有陀螺儀：重力自動旋轉');
-  flash(notes.length ? notes.join(' · ')
-    : (mobile ? '傾斜手機 · 手指撥開 · 點兩下切換取樣' : '移動滑鼠傾斜 · 按住拖曳撥開 · 點兩下切換取樣'), 3000);
   keepAwake();
 });
-
-let tagTimer;
-function flash(text, ms = 1400) {
-  tag.textContent = text; tag.classList.add('show');
-  clearTimeout(tagTimer); tagTimer = setTimeout(() => tag.classList.remove('show'), ms);
-}
 
 // 螢幕常亮
 let lock = null;
